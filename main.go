@@ -1,18 +1,19 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"os"
-	"os/exec"
-	"os/signal"
-	"regexp"
-	"runtime"
-	"strings"
-	"syscall"
-	"io"
+    "bufio"
+    "encoding/json"
+    "flag"
+    "fmt"
+    "log"
+    "os"
+    "os/exec"
+    "os/signal"
+    "regexp"
+    "runtime"
+    "strings"
+    "syscall"
+    "time"
 
 	"github.com/aandrew-me/tgpt/v2/src/bubbletea"
 	"github.com/aandrew-me/tgpt/v2/src/helper"
@@ -30,40 +31,6 @@ var bold = color.New(color.Bold)
 var blue = color.New(color.FgBlue)
 
 var programLoop = true
-
-func sendToSocket(message string) {
-    // Zeilenumbrüche gegen <br> ersetzen
-    message = strings.ReplaceAll(message, "\n", "<br>")
-
-    // Anfang <n> und Ende </n> hinzufügen
-    message = "<div>" + message + "</div>"
-
-	// Zum Anzeigen im Terminal aktivieren
-    // fmt.Println("Sende an Socket:", message)
-
-    cmd := exec.Command("socat", "-", "UNIX-CONNECT:wired-bot.sock")
-
-    stdin, err := cmd.StdinPipe()
-    if err != nil {
-        fmt.Println("Fehler bei StdinPipe:", err)
-        return
-    }
-
-    if err := cmd.Start(); err != nil {
-        fmt.Println("Fehler beim Starten von socat:", err)
-        return
-    }
-
-    _, err = io.WriteString(stdin, message+"\n")
-    if err != nil {
-        fmt.Println("Fehler beim Schreiben:", err)
-    }
-    stdin.Close()
-
-    if err := cmd.Wait(); err != nil {
-        fmt.Println("Fehler bei socat:", err)
-    }
-}
 
 func main() {
 	var userInput = ""
@@ -385,11 +352,20 @@ func main() {
 				responseObjects, responseTxt := helper.GetData(input, main_params, structs.ExtraOptions{IsInteractive: true, IsNormal: true, IsGetSilent: *isQuiet})
 
 				if len(*logFile) > 0 {
-					utils.LogToFile(responseTxt, "ASSISTANT_RESPONSE", *logFile)
-				}			
-				
-				// Luigi
-				sendToSocket(responseTxt)
+                    utils.LogToFile(responseTxt, "ASSISTANT_RESPONSE", *logFile)
+
+                    // Erst /clear senden
+                    clearCmd := exec.Command("screen", "-S", "wirebot", "-p", "wirebot", "-X", "stuff", "/clear\r")
+                    if err := clearCmd.Run(); err != nil {
+                        log.Printf("Fehler beim Senden von /clear an screen: %v", err)
+                    }
+
+                    // An screen senden
+                    cleanText := removeWebSearchBlock(responseTxt)
+                    cleanText = removeBrackets(cleanText)  // falls du noch eckige Klammern entfernen willst
+                    say := prepareSayText(cleanText)
+                    sendToScreenInChunks(say, 800)
+                }
 
 				previousMessages = append(previousMessages, responseObjects...)
 				history = append(history, input)
@@ -520,7 +496,6 @@ func main() {
 				if len(*logFile) > 0 {
 					utils.LogToFile(responseTxt, "ASSISTANT_RESPONSE", *logFile)
 				}
-				
 				previousMessages = append(previousMessages, responseObjects...)
 				history = append(history, input)
 				lastResponse = responseTxt
@@ -763,6 +738,117 @@ func main() {
 		formattedInput := strings.TrimSpace(input)
 		helper.GetData(*preprompt+formattedInput+pipedInput, main_params, structs.ExtraOptions{IsInteractive: false})
 	}
+}
+
+func prepareSayText(responseTxt string) string {
+    say := strings.ReplaceAll(responseTxt, "\r", "")
+    say = strings.ReplaceAll(say, "\n", "<br>")
+    return say
+}
+
+func sendToScreenInChunks(text string, maxLen int) {
+    sentenceRegex := regexp.MustCompile(`[^.!?]+[.!?]`)
+    sentences := sentenceRegex.FindAllString(text, -1)
+
+    var chunk strings.Builder
+
+    for _, sentence := range sentences {
+        if chunk.Len()+len(sentence) <= maxLen {
+            chunk.WriteString(sentence)
+        } else {
+            chunkStr := chunk.String()
+            // Führende Whitespace und <br> entfernen
+            for {
+                chunkStr = strings.TrimLeft(chunkStr, " \t\n\r")
+                if strings.HasPrefix(chunkStr, "<br>") {
+                    chunkStr = chunkStr[len("<br>"):]
+                } else {
+                    break
+                }
+            }
+
+            sendChunk("<n>" + chunkStr + "</n>")
+
+            chunk.Reset()
+            chunk.WriteString(sentence)
+        }
+    }
+
+    if chunk.Len() > 0 {
+        chunkStr := chunk.String()
+        for {
+            chunkStr = strings.TrimLeft(chunkStr, " \t\n\r")
+            if strings.HasPrefix(chunkStr, "<br>") {
+                chunkStr = chunkStr[len("<br>"):]
+            } else {
+                break
+            }
+        }
+        sendChunk("<n>" + chunkStr + "</n>")
+    }
+    
+    os.Remove(os.ExpandEnv("$HOME/.wirebot/gpt.busy"))
+}
+
+func sendChunk(chunk string) {
+    // Chunk senden
+    err := exec.Command("screen", "-S", "wirebot", "-p", "wirebot", "-X", "stuff", chunk).Run()
+    if err != nil {
+        log.Printf("Fehler beim Senden an screen (Text): %v", err)
+    }
+
+    time.Sleep(100 * time.Millisecond)
+
+    // Enter senden
+    err = exec.Command("screen", "-S", "wirebot", "-p", "wirebot", "-X", "stuff", "\n").Run()
+    if err != nil {
+        log.Printf("Fehler beim Senden von Enter: %v", err)
+    }
+
+    time.Sleep(100 * time.Millisecond)
+
+    // /clear senden
+    err = exec.Command("screen", "-S", "wirebot", "-p", "wirebot", "-X", "stuff", "/clear").Run()
+    if err != nil {
+        log.Printf("Fehler beim Senden von /clear: %v", err)
+    }
+
+    time.Sleep(100 * time.Millisecond)
+
+    // Enter nach /clear senden
+    err = exec.Command("screen", "-S", "wirebot", "-p", "wirebot", "-X", "stuff", "\n").Run()
+    if err != nil {
+        log.Printf("Fehler beim Senden von Enter nach /clear: %v", err)
+    }
+
+    time.Sleep(100 * time.Millisecond)
+}
+
+func removeBrackets(text string) string {
+    re := regexp.MustCompile(`$begin:math:display$\\d+$end:math:display$`)
+    return re.ReplaceAllString(text, "")
+}
+
+func removeWebSearchBlock(text string) string {
+    lines := strings.Split(text, "\n")
+    var result []string
+
+    skipNext := false
+    for i := 0; i < len(lines); i++ {
+        if skipNext {
+            // Wir überspringen diese Zeile (die Leerzeile nach @web_search)
+            skipNext = false
+            continue
+        }
+        if strings.HasPrefix(lines[i], "@web_search") {
+            // Zeile mit @web_search gefunden, überspringen + nächste Zeile überspringen
+            skipNext = true
+            continue
+        }
+        result = append(result, lines[i])
+    }
+
+    return strings.Join(result, "\n")
 }
 
 func exit(_ *Prompt.Buffer) {
